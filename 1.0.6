@@ -1,0 +1,435 @@
+#define blower_pin 2    
+#define valve_open_pin 12   // RPWM - Clockwise
+#define valve_close_pin 13  // LPWM - Counter-clockwise
+#define camera_pin 27       // High signal = tilapia eating
+#define TRIG_PIN 5          // Ultrasonic trigger pin
+#define ECHO_PIN 18         // Ultrasonic echo pin
+
+#define BLYNK_TEMPLATE_ID "TMPL6okmf04Wj"
+#define BLYNK_TEMPLATE_NAME "SMART AQUA FEEDER"
+#define BLYNK_AUTH_TOKEN "f33FSB-73GJ61_tvYGoU9V4L1PG2rUlI"
+#define BLYNK_PRINT Serial
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <time.h>
+
+char ssid[] = "12345678";    
+char pass[] = "12345678"; 
+BlynkTimer timer;
+
+// Blynk virtual pin assignments
+#define blower_virtual_pin V0
+#define valve_virtual_pin V1
+#define camera_virtual_pin V3
+#define manual_auto_virtual_pin V4
+#define scheduler1_virtual_pin V5
+#define scheduler2_virtual_pin V6
+#define scheduler3_virtual_pin V7
+#define feed_amount_virtual_pin V10
+#define feeding_status_virtual_pin V21
+#define estimated_biomass_virtual_pin V22
+#define remaining_feeds_virtual_pin V23
+#define feed_level_virtual_pin V24  // Feed level percentage
+
+bool manualMode = false;
+int feedAmountSeconds = 5;  // Each dispense cycle (5kg = 5 seconds)
+bool blowerRunning = false;
+double estimatedBiomass = 1500.0;
+int remainingFeeds = 75;
+
+// Smart feeding variables
+int targetFeedAmount = 30;  // Total target in seconds (can be set from Blynk)
+int dispensedAmount = 0;    // Track how much has been dispensed
+const int DISPENSE_CYCLE = 20;  // 20 seconds per cycle (1kg)
+const int WAIT_TIME = 10;      // 10 seconds to check if eating
+const int VALVE_OPEN_TIME = 3;  // 3 seconds to open linear actuator
+const int VALVE_CLOSE_TIME = 4; // 4 seconds to close linear actuator
+
+// Ultrasonic sensor variables
+const int RESERVOIR_HEIGHT = 80;  // 80cm from top to bottom (empty)
+float currentFeedLevel = 0;       // Current feed level percentage
+
+// NTP Time settings
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 8 * 3600;  // GMT+8 for Philippines
+const int daylightOffset_sec = 0;
+
+// Scheduler settings
+int scheduler1_hour = -1;
+int scheduler1_minute = -1;
+int scheduler2_hour = -1;
+int scheduler2_minute = -1;
+int scheduler3_hour = -1;
+int scheduler3_minute = -1;
+
+bool scheduler1_triggered = false;
+bool scheduler2_triggered = false;
+bool scheduler3_triggered = false;
+
+void setup()
+{
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  // Initialize time synchronization
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Waiting for NTP time sync...");
+  delay(2000);
+  printLocalTime();
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect();
+
+  pinMode(blower_pin, OUTPUT);
+  pinMode(valve_open_pin, OUTPUT);
+  pinMode(valve_close_pin, OUTPUT);
+  pinMode(camera_pin, INPUT);  // Camera detection pin
+  pinMode(TRIG_PIN, OUTPUT);   // Ultrasonic trigger
+  pinMode(ECHO_PIN, INPUT);    // Ultrasonic echo
+  digitalWrite(blower_pin, LOW);
+  digitalWrite(valve_open_pin, LOW);
+  digitalWrite(valve_close_pin, LOW);
+
+  // Setup timer to check schedules every second
+  timer.setInterval(1000L, checkSchedules);
+  
+  // Update camera status LED every 500ms
+  timer.setInterval(500L, updateCameraStatus);
+  
+  // Update feed level every 5 seconds
+  timer.setInterval(5000L, updateFeedLevel);
+
+  Serial.println("Smart AquaFeeder Ready.");
+}
+
+void loop()
+{
+  Blynk.run();
+  timer.run();
+}
+
+BLYNK_WRITE(manual_auto_virtual_pin) {
+  manualMode = param.asInt();
+  Serial.print("System mode: ");
+  Serial.println(manualMode ? "MANUAL" : "AUTO");
+}
+
+BLYNK_WRITE(feed_amount_virtual_pin) {
+  float kg = param.asFloat();
+  if (kg > 0 && kg <= 60) {  // Max 60kg
+    targetFeedAmount = (int)(kg * 20);  // Convert kg to seconds (1kg = 20 seconds)
+    Serial.println("Target feed amount set to " + String(kg, 1) + " kg (" + String(targetFeedAmount) + " seconds)");
+  } else {
+    Serial.println("Invalid feed amount. Must be between 0.1-60 kg.");
+  }
+}
+
+BLYNK_WRITE(scheduler1_virtual_pin) {
+  long startTimeInSecs = param[0].asLong();
+  
+  // Convert seconds to hours and minutes
+  scheduler1_hour = startTimeInSecs / 3600;
+  scheduler1_minute = (startTimeInSecs % 3600) / 60;
+  scheduler1_triggered = false;
+  
+  Serial.print("SCHEDULER 1 set to: ");
+  Serial.print(scheduler1_hour);
+  Serial.print(":");
+  Serial.println(scheduler1_minute);
+}
+
+BLYNK_WRITE(scheduler2_virtual_pin) {
+  long startTimeInSecs = param[0].asLong();
+  
+  // Convert seconds to hours and minutes
+  scheduler2_hour = startTimeInSecs / 3600;
+  scheduler2_minute = (startTimeInSecs % 3600) / 60;
+  scheduler2_triggered = false;
+  
+  Serial.print("SCHEDULER 2 set to: ");
+  Serial.print(scheduler2_hour);
+  Serial.print(":");
+  Serial.println(scheduler2_minute);
+}
+
+BLYNK_WRITE(scheduler3_virtual_pin) {
+  long startTimeInSecs = param[0].asLong();
+  
+  // Convert seconds to hours and minutes
+  scheduler3_hour = startTimeInSecs / 3600;
+  scheduler3_minute = (startTimeInSecs % 3600) / 60;
+  scheduler3_triggered = false;
+  
+  Serial.print("SCHEDULER 3 set to: ");
+  Serial.print(scheduler3_hour);
+  Serial.print(":");
+  Serial.println(scheduler3_minute);
+}
+
+BLYNK_WRITE(blower_virtual_pin) {
+  if (!manualMode) return;
+  int state = param.asInt();
+  digitalWrite(blower_pin, state ? HIGH : LOW);
+  Serial.println(String("BLOWER turned ") + (state ? "ON" : "OFF"));
+}
+
+BLYNK_WRITE(valve_virtual_pin) {
+  if (!manualMode) return;
+  
+  int state = param.asInt();
+  
+  if (state == 1) {
+    // Turn ON - Rotate Clockwise (Open valve)
+    analogWrite(valve_open_pin, 255);   // Full speed clockwise
+    analogWrite(valve_close_pin, 0);    // Ensure counter-clockwise is off
+    Serial.println("VALVE rotating CLOCKWISE (Opening)");
+  } else {
+    // Turn OFF - Rotate Counter-clockwise (Close valve)
+    analogWrite(valve_open_pin, 0);     // Ensure clockwise is off
+    analogWrite(valve_close_pin, 255);  // Full speed counter-clockwise
+    Serial.println("VALVE rotating COUNTER-CLOCKWISE (Closing)");
+  }
+}
+
+BLYNK_CONNECTED() {
+  Serial.println("Connected to Blynk!");
+  
+  // Sync all values from dashboard
+  Blynk.syncVirtual(manual_auto_virtual_pin);
+  Blynk.syncVirtual(feed_amount_virtual_pin);
+  Blynk.syncVirtual(scheduler1_virtual_pin);
+  Blynk.syncVirtual(scheduler2_virtual_pin);
+  Blynk.syncVirtual(scheduler3_virtual_pin);
+  
+  // Send current status to dashboard
+  Blynk.virtualWrite(estimated_biomass_virtual_pin, estimatedBiomass);
+  Blynk.virtualWrite(remaining_feeds_virtual_pin, remainingFeeds);
+  Blynk.virtualWrite(feed_level_virtual_pin, currentFeedLevel);
+  
+  Serial.println("Dashboard values synced!");
+}
+
+void printLocalTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  Serial.print("Current time: ");
+  Serial.print(timeinfo.tm_hour);
+  Serial.print(":");
+  Serial.print(timeinfo.tm_min);
+  Serial.print(":");
+  Serial.println(timeinfo.tm_sec);
+}
+
+void updateCameraStatus() {
+  // Read camera sensor and update dashboard LED
+  int cameraStatus = digitalRead(camera_pin);
+  Blynk.virtualWrite(feeding_status_virtual_pin, cameraStatus);
+}
+
+float measureDistance() {
+  long duration;
+  float distance;
+  
+  // Clear the trigger pin
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  
+  // Send 10 microsecond pulse to trigger
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  // Read the echo pin, returns time in microseconds
+  duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
+  
+  // Calculate distance in centimeters
+  distance = (duration * 0.0343) / 2;
+  
+  // Return -1 if out of range
+  if (duration == 0) {
+    return -1;
+  }
+  
+  return distance;
+}
+
+void updateFeedLevel() {
+  float distance = measureDistance();
+  
+  if (distance < 0) {
+    Serial.println("Feed level sensor: Out of range");
+    return;
+  }
+  
+  // Calculate feed level percentage
+  // 0cm = 100% full, 80cm = 0% empty
+  if (distance > RESERVOIR_HEIGHT) {
+    distance = RESERVOIR_HEIGHT;  // Cap at maximum
+  }
+  
+  currentFeedLevel = 100.0 - ((distance / RESERVOIR_HEIGHT) * 100.0);
+  
+  // Send to dashboard
+  Blynk.virtualWrite(feed_level_virtual_pin, (int)currentFeedLevel);
+  
+  Serial.print("Feed level: ");
+  Serial.print(currentFeedLevel, 1);
+  Serial.print("% (Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm)");
+  
+  // Warning if feed is low
+  if (currentFeedLevel < 20) {
+    Serial.println("⚠️ WARNING: Feed level is LOW!");
+  }
+}
+
+void checkSchedules() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return;
+  }
+  
+  int currentHour = timeinfo.tm_hour;
+  int currentMinute = timeinfo.tm_min;
+  
+  // Check Scheduler 1
+  if (scheduler1_hour == currentHour && scheduler1_minute == currentMinute && !scheduler1_triggered) {
+    scheduler1_triggered = true;
+    Serial.println("SCHEDULER 1 TIME MATCHED!");
+    if (!manualMode && !blowerRunning) {
+      Serial.println("SCHEDULER 1 FEED STARTING");
+      startAutoFeed();
+    }
+  }
+  
+  // Reset trigger flag when minute changes
+  if (scheduler1_minute != currentMinute) {
+    scheduler1_triggered = false;
+  }
+  
+  // Check Scheduler 2
+  if (scheduler2_hour == currentHour && scheduler2_minute == currentMinute && !scheduler2_triggered) {
+    scheduler2_triggered = true;
+    Serial.println("SCHEDULER 2 TIME MATCHED!");
+    if (!manualMode && !blowerRunning) {
+      Serial.println("SCHEDULER 2 FEED STARTING");
+      startAutoFeed();
+    }
+  }
+  
+  // Reset trigger flag when minute changes
+  if (scheduler2_minute != currentMinute) {
+    scheduler2_triggered = false;
+  }
+  
+  // Check Scheduler 3
+  if (scheduler3_hour == currentHour && scheduler3_minute == currentMinute && !scheduler3_triggered) {
+    scheduler3_triggered = true;
+    Serial.println("SCHEDULER 3 TIME MATCHED!");
+    if (!manualMode && !blowerRunning) {
+      Serial.println("SCHEDULER 3 FEED STARTING");
+      startAutoFeed();
+    }
+  }
+  
+  // Reset trigger flag when minute changes
+  if (scheduler3_minute != currentMinute) {
+    scheduler3_triggered = false;
+  }
+}
+
+void startAutoFeed() {
+  blowerRunning = true;
+  dispensedAmount = 0;  // Reset dispensed amount
+  
+  Serial.println("=== SMART FEEDING STARTED ===");
+  Serial.println("Target: " + String(targetFeedAmount) + " seconds");
+  
+  // Start the feeding cycle
+  dispenseFeedCycle();
+}
+
+void dispenseFeedCycle() {
+  // Check if target reached
+  if (dispensedAmount >= targetFeedAmount) {
+    Serial.println("Target feed amount reached!");
+    stopFeeding();
+    return;
+  }
+  
+  Serial.println("\n--- Dispensing 1kg ---");
+  
+  // Step 1: Start blower
+  digitalWrite(blower_pin, HIGH);
+  Serial.println("BLOWER turned ON");
+  
+  timer.setTimeout(2000L, []() {
+    // Step 2: Open valve - rotate clockwise for 3 seconds
+    analogWrite(valve_open_pin, 255);
+    analogWrite(valve_close_pin, 0);
+    Serial.println("LINEAR ACTUATOR opening (3 seconds)...");
+    
+    timer.setTimeout(VALVE_OPEN_TIME * 1000L, []() {
+      // Stop actuator after opening
+      analogWrite(valve_open_pin, 0);
+      analogWrite(valve_close_pin, 0);
+      Serial.println("Valve OPENED - Dispensing feed...");
+      
+      // Step 3: Dispense for set cycle time
+      timer.setTimeout((DISPENSE_CYCLE-5) * 1000L, []() {
+        dispensedAmount += DISPENSE_CYCLE;
+        Serial.println("Total dispensed: " + String(dispensedAmount) + "/" + String(targetFeedAmount) + " seconds");
+        
+        // Step 4: Close valve - rotate counter-clockwise for 4 seconds
+        analogWrite(valve_open_pin, 0);
+        analogWrite(valve_close_pin, 255);
+        Serial.println("LINEAR ACTUATOR closing (4 seconds)...");
+        
+        timer.setTimeout(VALVE_CLOSE_TIME * 1000L, []() {
+          // Stop actuator after closing
+          analogWrite(valve_open_pin, 0);
+          analogWrite(valve_close_pin, 0);
+          Serial.println("Valve CLOSED");
+          
+          // Step 5: Wait and check camera
+          Serial.println("Waiting " + String(WAIT_TIME) + " seconds - Checking if tilapia are eating...");
+          
+          timer.setTimeout(WAIT_TIME * 1000L, []() {
+            // Check camera pin
+            int cameraSignal = digitalRead(camera_pin);
+            
+            if (cameraSignal == HIGH) {
+              Serial.println("✓ Tilapia ARE EATING - Dispensing more feed");
+              dispenseFeedCycle();  // Continue feeding
+            } else {
+              Serial.println("✗ Tilapia STOPPED EATING - Ending feed cycle");
+              stopFeeding();
+            }
+          });
+        });
+      });
+    });
+  });
+}
+
+void stopFeeding() {
+  digitalWrite(blower_pin, LOW);
+  analogWrite(valve_open_pin, 0);
+  analogWrite(valve_close_pin, 0);
+  blowerRunning = false;
+  
+  Serial.println("\n=== FEEDING COMPLETE ===");
+  Serial.println("Total dispensed: " + String(dispensedAmount) + " seconds");
+  Serial.println("BLOWER OFF, VALVE stopped");
+}
