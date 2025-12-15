@@ -1,0 +1,29 @@
+#include "HX711.h"
+
+#define calibration_factor 10197.0 calibration factor
+
+#define LOADCELL_DOUT_PIN  6
+#define LOADCELL_SCK_PIN  7
+
+HX711 scale;
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("HX711 scale demo");
+
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(calibration_factor);
+  scale.tare();
+
+  Serial.println("Readings:");
+}
+
+void loop() {
+  float lbs = scale.get_units();
+  float kg = lbs * 0.453592;
+  
+  Serial.print("Reading: ");
+  Serial.print(kg, 1);
+  Serial.print(" kg");
+  Serial.println();
+}
