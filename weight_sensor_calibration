@@ -1,0 +1,68 @@
+#include "HX711.h"
+
+#define LOADCELL_DOUT_PIN  6
+#define LOADCELL_SCK_PIN  7
+
+HX711 scale;
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("HX711 Calibration");
+  Serial.println("=================");
+  
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  
+  Serial.println("Remove all weight and wait...");
+  delay(3000);
+  
+  scale.tare(); // Zero the scale
+  
+  Serial.println("Tare complete!");
+  Serial.println("\nPlace your known weight (e.g., 8.6kg or 10kg)");
+  Serial.println("Then open Serial Monitor and type the exact weight in kg");
+  Serial.println("Example: type 8.6 or 10\n");
+}
+
+void loop() {
+  // Check if user entered weight
+  if (Serial.available() > 0) {
+    float known_weight_kg = Serial.parseFloat();
+    
+    if (known_weight_kg > 0) {
+      Serial.print("\nYou entered: ");
+      Serial.print(known_weight_kg);
+      Serial.println(" kg");
+      
+      Serial.println("Reading scale...");
+      delay(1000);
+      
+      float reading = scale.get_units(10);
+      
+      Serial.print("Raw reading: ");
+      Serial.println(reading);
+      
+      // Calculate correct calibration factor
+      float correct_factor = reading / (known_weight_kg / 0.453592); // Convert kg to lbs for calculation
+      
+      Serial.print("\n=========================");
+      Serial.print("\nYour NEW calibration_factor: ");
+      Serial.println(correct_factor, 1);
+      Serial.println("=========================\n");
+      
+      Serial.println("Update your code with this value!");
+      
+      // Wait before allowing another calibration
+      delay(5000);
+    }
+  }
+  
+  // Show current readings
+  float current_lbs = scale.get_units();
+  float current_kg = current_lbs * 0.453592;
+  
+  Serial.print("Current: ");
+  Serial.print(current_kg, 2);
+  Serial.println(" kg");
+  
+  delay(1000);
+}
