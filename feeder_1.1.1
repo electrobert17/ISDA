@@ -1,0 +1,1026 @@
+#define blower_pin 2    
+#define valve_open_pin 12   // RPWM - Clockwise
+#define valve_close_pin 13  // LPWM - Counter-clockwise
+#define camera_pin 27       // High signal = tilapia eating
+#define TRIG_PIN 5          // Ultrasonic trigger pin
+#define ECHO_PIN 18         // Ultrasonic echo pin
+#define LOADCELL_DOUT_PIN 32 // Load cell data pin
+#define LOADCELL_SCK_PIN 33 // Load cell clock pin
+
+#define BLYNK_TEMPLATE_ID "TMPL6okmf04Wj"
+#define BLYNK_TEMPLATE_NAME "SMART AQUA FEEDER"
+#define BLYNK_AUTH_TOKEN "f33FSB-73GJ61_tvYGoU9V4L1PG2rUlI"
+#define BLYNK_PRINT Serial
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <time.h>
+#include <Preferences.h>
+#include <HX711.h>
+
+char ssid[] = "Smart Indoor Farming";    
+char pass[] = "smart2026"; 
+BlynkTimer timer;
+
+// HX711 Load Cell
+HX711 scale;
+float CALIBRATION_FACTOR = -7050.0;
+bool scaleCalibrated = false;
+
+// Blynk virtual pin assignments
+#define blower_virtual_pin V0
+#define valve_virtual_pin V1
+#define camera_virtual_pin V3
+#define mode_selector_virtual_pin V4  // Changed from manual_auto to mode selector
+#define scheduler1_virtual_pin V5
+#define scheduler2_virtual_pin V6
+#define scheduler3_virtual_pin V7
+#define tilapia_population_virtual_pin V9
+#define feed_amount_virtual_pin V10
+#define feeding_status_virtual_pin V21
+#define estimated_biomass_virtual_pin V22
+#define low_feed_alert_virtual_pin V23
+#define feed_level_virtual_pin V24
+#define dispensed_weight_virtual_pin V25
+#define reset_system_virtual_pin V26
+#define weight_per_fish_virtual_pin V27
+#define calibrate_scale_virtual_pin V28
+#define camera_delay_virtual_pin V29  // NEW: Adjustable camera check delay
+#define terminal_virtual_pin V30
+
+// Terminal widget
+WidgetTerminal terminal(terminal_virtual_pin);
+
+// ===== NEW: OPERATION MODES =====
+enum OperationMode {
+  MODE_MANUAL = 0,      // Manual control only
+  MODE_AUTO = 1,        // Smart feeding with camera feedback
+  MODE_AD_LIBITUM = 2,  // Feed until fish stop eating (no weight target)
+  MODE_WEIGHT_BASED = 3 // Feed until weight target met (no camera check)
+};
+
+OperationMode currentMode = MODE_MANUAL;
+bool blowerRunning = false;
+
+// Biomass calculation variables
+int tilapiaPopulation = 1500;
+int initialPopulation = 1500;
+float totalFeedDispensed = 0.0;
+float initialWeight = 0.05;
+float currentWeightPerTilapia = 0.05;
+float estimatedBiomass = 75.0;
+const float FCR = 1.5;
+
+// Persistent storage
+Preferences preferences;
+
+// Smart feeding variables
+float targetFeedAmount = 5.0;
+float dispensedAmountKg = 0.0;
+float feedingStartWeight = 0.0;
+float currentReservoirWeight = 0.0;
+int cameraCheckDelay = 10;         // NEW: Configurable camera delay (default 10 seconds)
+const int VALVE_OPEN_TIME = 3;
+const int VALVE_CLOSE_TIME = 4;
+const int DISPENSE_TIME = 15;
+
+// Ultrasonic sensor variables
+const int RESERVOIR_HEIGHT = 56;
+const int LOW_FEED_THRESHOLD = 50;
+float currentFeedLevel = 0;
+bool lowFeedAlert = false;
+
+// NTP Time settings
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 8 * 3600;
+const int daylightOffset_sec = 0;
+
+// Scheduler settings
+int scheduler1_hour = -1;
+int scheduler1_minute = -1;
+int scheduler2_hour = -1;
+int scheduler2_minute = -1;
+int scheduler3_hour = -1;
+int scheduler3_minute = -1;
+
+bool scheduler1_triggered = false;
+bool scheduler2_triggered = false;
+bool scheduler3_triggered = false;
+
+void setup()
+{
+  Serial.begin(115200);
+
+  preferences.begin("aquafeeder", false);
+  
+  totalFeedDispensed = preferences.getFloat("totalFeed", 0.0);
+  tilapiaPopulation = preferences.getInt("population", 1500);
+  initialPopulation = preferences.getInt("initPopulation", 1500);
+  
+  Serial.println("=== Loaded from memory ===");
+  Serial.println("Total feed dispensed: " + String(totalFeedDispensed, 2) + " kg");
+  Serial.println("Population: " + String(tilapiaPopulation));
+
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Waiting for NTP time sync...");
+  delay(2000);
+  printLocalTime();
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect();
+
+  pinMode(blower_pin, OUTPUT);
+  pinMode(valve_open_pin, OUTPUT);
+  pinMode(valve_close_pin, OUTPUT);
+  pinMode(camera_pin, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(blower_pin, LOW);
+  digitalWrite(valve_open_pin, LOW);
+  digitalWrite(valve_close_pin, LOW);
+
+  Serial.println("Initializing HX711 load cell...");
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  
+  if (!scale.is_ready()) {
+    Serial.println("❌ ERROR: Load cell not detected!");
+    terminalPrint("❌ ERROR: Load cell not connected properly!");
+  } else {
+    Serial.println("✓ Load cell detected");
+    CALIBRATION_FACTOR = preferences.getFloat("calibration", -7050.0);
+    scale.set_scale(CALIBRATION_FACTOR);
+    terminalPrint("Load cell ready");
+    terminalPrint("Calibration factor: " + String(CALIBRATION_FACTOR, 1));
+  }
+  
+  scale.tare();
+  Serial.println("Load cell tared (zeroed).");
+  
+  delay(1000);
+  if (scale.is_ready()) {
+    currentReservoirWeight = scale.get_units(10);
+    Serial.print("Current reading: ");
+    Serial.print(currentReservoirWeight, 2);
+    Serial.println(" kg");
+  }
+
+  calculateBiomass();
+
+  timer.setInterval(1000L, checkSchedules);
+  timer.setInterval(500L, updateCameraStatus);
+  timer.setInterval(5000L, checkFeedLevel);
+  timer.setInterval(3000L, updateWeightDisplay);  // Changed from 2000L to 3000L (every 3 seconds)
+
+  Serial.println("Smart AquaFeeder Ready with 4 modes!");
+  terminalPrint("=== Smart AquaFeeder Ready ===");
+  terminalPrint("Modes: MANUAL | AUTO | AD LIBITUM | WEIGHT BASED");
+  terminalPrint("Camera check delay: " + String(cameraCheckDelay) + " seconds");
+  terminalPrint("Total feed: " + String(totalFeedDispensed, 2) + " kg");
+  terminalPrint("Population: " + String(tilapiaPopulation));
+}
+
+void loop()
+{
+  Blynk.run();
+  timer.run();
+}
+
+void terminalPrint(String message) {
+  Serial.println(message);
+  terminal.println(message);
+  terminal.flush();
+}
+
+void calculateBiomass() {
+  float weightGain = totalFeedDispensed / FCR;
+  currentWeightPerTilapia = initialWeight + (weightGain / initialPopulation);
+  estimatedBiomass = currentWeightPerTilapia * tilapiaPopulation;
+  
+  Blynk.virtualWrite(estimated_biomass_virtual_pin, estimatedBiomass);
+  Blynk.virtualWrite(weight_per_fish_virtual_pin, currentWeightPerTilapia * 1000);
+  
+  String biomassInfo = "=== BIOMASS UPDATE ===\n";
+  biomassInfo += "Population: " + String(tilapiaPopulation) + "\n";
+  biomassInfo += "Total feed: " + String(totalFeedDispensed, 2) + " kg\n";
+  biomassInfo += "Weight/fish: " + String(currentWeightPerTilapia * 1000, 1) + " g\n";
+  biomassInfo += "Biomass: " + String(estimatedBiomass, 2) + " kg";
+  
+  Serial.println(biomassInfo);
+  terminalPrint(biomassInfo);
+}
+
+void updateWeightDisplay() {
+  if (scale.is_ready() && !blowerRunning) {
+    currentReservoirWeight = scale.get_units(5);
+    
+    // Show weight in terminal with status indicators
+    String weightStatus = "⚖️ Feed Weight: " + String(currentReservoirWeight, 2) + " kg";
+    
+    // Interpret the weight reading
+    if (currentReservoirWeight < -2.0) {
+      weightStatus += " ⚠️ LARGE NEGATIVE! Check connections";
+      terminalPrint(weightStatus);
+    } else if (currentReservoirWeight < -0.5) {
+      weightStatus += " ⚠️ Negative - possible drift or vibration";
+      terminalPrint(weightStatus);
+    } else if (currentReservoirWeight < 0) {
+      weightStatus += " (minor drift, within tolerance)";
+      // Only show in Serial, not terminal spam
+      Serial.println(weightStatus);
+    } else if (currentReservoirWeight < 5) {
+      weightStatus += " ⚠️ LOW FEED! Refill soon";
+      terminalPrint(weightStatus);
+    } else if (currentReservoirWeight > 35) {
+      weightStatus += " (FULL - max ~30kg feed capacity)";
+      Serial.println(weightStatus);
+    } else {
+      // Normal weight display (between 5-35 kg)
+      terminalPrint(weightStatus);
+    }
+    
+    // Always log to Serial for debugging
+    Serial.print("Load Cell: ");
+    Serial.print(currentReservoirWeight, 3);
+    Serial.print(" kg | Total System Weight: ~");
+    Serial.print(40 + currentReservoirWeight, 1);
+    Serial.println(" kg");
+  } else if (!scale.is_ready()) {
+    static unsigned long lastErrorPrint = 0;
+    if (millis() - lastErrorPrint > 10000) {  // Only every 10 seconds
+      terminalPrint("❌ Load cell not responding! Check wiring.");
+      lastErrorPrint = millis();
+    }
+  }
+}
+
+// ===== NEW: MODE SELECTOR HANDLER =====
+BLYNK_WRITE(mode_selector_virtual_pin) {
+  int modeValue = param.asInt();
+  currentMode = (OperationMode)modeValue;
+  
+  String modeName;
+  String modeDescription;
+  
+  switch(currentMode) {
+    case MODE_MANUAL:
+      modeName = "MANUAL";
+      modeDescription = "Direct control of blower and valve";
+      break;
+    case MODE_AUTO:
+      modeName = "AUTO (Smart Feeding)";
+      modeDescription = "Feed with camera feedback until target weight OR fish stop eating";
+      break;
+    case MODE_AD_LIBITUM:
+      modeName = "AD LIBITUM";
+      modeDescription = "Feed continuously until fish stop eating (no weight limit)";
+      break;
+    case MODE_WEIGHT_BASED:
+      modeName = "WEIGHT BASED";
+      modeDescription = "Feed continuously until target weight reached (no camera check)";
+      break;
+  }
+  
+  terminalPrint("\n========================================");
+  terminalPrint("MODE CHANGED: " + modeName);
+  terminalPrint(modeDescription);
+  terminalPrint("========================================\n");
+  
+  Serial.println("System mode: " + modeName);
+}
+
+BLYNK_WRITE(tilapia_population_virtual_pin) {
+  tilapiaPopulation = param.asInt();
+  preferences.putInt("population", tilapiaPopulation);
+  
+  String msg = "Population updated: " + String(tilapiaPopulation);
+  Serial.println(msg);
+  terminalPrint(msg);
+  
+  calculateBiomass();
+}
+
+BLYNK_WRITE(feed_amount_virtual_pin) {
+  float kg = param.asFloat();
+  if (kg > 0 && kg <= 60) {
+    targetFeedAmount = kg;
+    String msg = "Target feed: " + String(kg, 1) + " kg";
+    Serial.println(msg);
+    terminalPrint(msg);
+  } else {
+    String error = "Invalid feed amount. Must be 0.1-60 kg.";
+    Serial.println(error);
+    terminalPrint(error);
+  }
+}
+
+// NEW: Camera check delay adjuster
+BLYNK_WRITE(camera_delay_virtual_pin) {
+  int seconds = param.asInt();
+  if (seconds >= 5 && seconds <= 60) {
+    cameraCheckDelay = seconds;
+    String msg = "Camera delay set: " + String(seconds) + " seconds";
+    Serial.println(msg);
+    terminalPrint(msg);
+    terminalPrint("Fish have " + String(seconds) + "s to settle before camera check");
+  } else {
+    String error = "Invalid delay. Must be 5-60 seconds.";
+    Serial.println(error);
+    terminalPrint(error);
+  }
+}
+
+BLYNK_WRITE(scheduler1_virtual_pin) {
+  long startTimeInSecs = param[0].asLong();
+  scheduler1_hour = startTimeInSecs / 3600;
+  scheduler1_minute = (startTimeInSecs % 3600) / 60;
+  scheduler1_triggered = false;
+  
+  String msg = "SCHEDULER 1 set: " + String(scheduler1_hour) + ":" + String(scheduler1_minute);
+  Serial.println(msg);
+  terminalPrint(msg);
+}
+
+BLYNK_WRITE(scheduler2_virtual_pin) {
+  long startTimeInSecs = param[0].asLong();
+  scheduler2_hour = startTimeInSecs / 3600;
+  scheduler2_minute = (startTimeInSecs % 3600) / 60;
+  scheduler2_triggered = false;
+  
+  String msg = "SCHEDULER 2 set: " + String(scheduler2_hour) + ":" + String(scheduler2_minute);
+  Serial.println(msg);
+  terminalPrint(msg);
+}
+
+BLYNK_WRITE(scheduler3_virtual_pin) {
+  long startTimeInSecs = param[0].asLong();
+  scheduler3_hour = startTimeInSecs / 3600;
+  scheduler3_minute = (startTimeInSecs % 3600) / 60;
+  scheduler3_triggered = false;
+  
+  String msg = "SCHEDULER 3 set: " + String(scheduler3_hour) + ":" + String(scheduler3_minute);
+  Serial.println(msg);
+  terminalPrint(msg);
+}
+
+BLYNK_WRITE(blower_virtual_pin) {
+  if (currentMode != MODE_MANUAL) return;  // Only works in manual mode
+  int state = param.asInt();
+  digitalWrite(blower_pin, state ? HIGH : LOW);
+  String msg = "BLOWER: " + String(state ? "ON" : "OFF");
+  Serial.println(msg);
+  terminalPrint(msg);
+}
+
+BLYNK_WRITE(valve_virtual_pin) {
+  if (currentMode != MODE_MANUAL) return;  // Only works in manual mode
+  
+  int state = param.asInt();
+  
+  if (state == 1) {
+    analogWrite(valve_open_pin, 255);
+    analogWrite(valve_close_pin, 0);
+    String msg = "VALVE: Opening (Clockwise)";
+    Serial.println(msg);
+    terminalPrint(msg);
+  } else {
+    analogWrite(valve_open_pin, 0);
+    analogWrite(valve_close_pin, 255);
+    String msg = "VALVE: Closing (Counter-clockwise)";
+    Serial.println(msg);
+    terminalPrint(msg);
+  }
+}
+
+BLYNK_WRITE(reset_system_virtual_pin) {
+  int buttonState = param.asInt();
+  
+  if (buttonState == 1) {
+    terminalPrint("\n========================================");
+    terminalPrint("    SYSTEM RESET INITIATED");
+    terminalPrint("========================================");
+    
+    totalFeedDispensed = 0.0;
+    tilapiaPopulation = 1500;
+    initialPopulation = 1500;
+    currentWeightPerTilapia = initialWeight;
+    estimatedBiomass = initialWeight * tilapiaPopulation;
+    
+    preferences.putFloat("totalFeed", 0.0);
+    preferences.putInt("population", 1500);
+    preferences.putInt("initPopulation", 1500);
+    
+    if (scale.is_ready()) {
+      scale.tare();
+      terminalPrint("✓ Load cell tared (reset to zero)");
+      delay(1000);
+      float testWeight = scale.get_units(5);
+      terminalPrint("Current reading: " + String(testWeight, 2) + " kg");
+    }
+    
+    Blynk.virtualWrite(tilapia_population_virtual_pin, tilapiaPopulation);
+    Blynk.virtualWrite(estimated_biomass_virtual_pin, estimatedBiomass);
+    Blynk.virtualWrite(weight_per_fish_virtual_pin, currentWeightPerTilapia * 1000);
+    Blynk.virtualWrite(dispensed_weight_virtual_pin, 0);
+    
+    terminalPrint("✓ System RESET complete!");
+    terminalPrint("========================================\n");
+    
+    Blynk.virtualWrite(reset_system_virtual_pin, 0);
+  }
+}
+
+BLYNK_WRITE(calibrate_scale_virtual_pin) {
+  int buttonState = param.asInt();
+  
+  if (buttonState == 1) {
+    terminalPrint("\n========================================");
+    terminalPrint("   SCALE CALIBRATION MODE");
+    terminalPrint("========================================");
+    
+    if (!scale.is_ready()) {
+      terminalPrint("❌ ERROR: Scale not ready!");
+      Blynk.virtualWrite(calibrate_scale_virtual_pin, 0);
+      return;
+    }
+    
+    terminalPrint("STEP 1: Remove all weight from scale");
+    terminalPrint("Press button again when ready...");
+    
+    static bool waitingForTare = true;
+    if (waitingForTare) {
+      waitingForTare = false;
+      Blynk.virtualWrite(calibrate_scale_virtual_pin, 0);
+      return;
+    }
+    
+    scale.tare();
+    terminalPrint("✓ Scale tared (zeroed)");
+    delay(2000);
+    
+    terminalPrint("\nSTEP 2: Place KNOWN weight on scale");
+    terminalPrint("Then enter weight in terminal:");
+    terminalPrint("Type: CAL 10.0");
+    
+    Blynk.virtualWrite(calibrate_scale_virtual_pin, 0);
+  }
+}
+
+BLYNK_WRITE(terminal_virtual_pin) {
+  String input = param.asStr();
+  
+  if (input.startsWith("CAL ")) {
+    float knownWeight = input.substring(4).toFloat();
+    
+    if (knownWeight <= 0 || knownWeight > 100) {
+      terminalPrint("❌ Invalid weight. Must be 0.1-100 kg");
+      return;
+    }
+    
+    terminalPrint("Calibrating with " + String(knownWeight, 1) + " kg...");
+    
+    long rawReading = scale.get_units(10);
+    CALIBRATION_FACTOR = rawReading / knownWeight;
+    scale.set_scale(CALIBRATION_FACTOR);
+    preferences.putFloat("calibration", CALIBRATION_FACTOR);
+    
+    delay(500);
+    float measuredWeight = scale.get_units(10);
+    
+    terminalPrint("\n=== CALIBRATION COMPLETE ===");
+    terminalPrint("Calibration factor: " + String(CALIBRATION_FACTOR, 1));
+    terminalPrint("Measured: " + String(measuredWeight, 2) + " kg");
+    terminalPrint("========================================\n");
+  }
+  else if (input.equals("TARE")) {
+    // NEW: Quick tare command with stability check
+    if (!scale.is_ready()) {
+      terminalPrint("❌ Load cell not ready!");
+      return;
+    }
+    
+    terminalPrint("Checking stability before taring...");
+    
+    // Take 5 readings to check stability
+    float readings[5];
+    for(int i = 0; i < 5; i++) {
+      readings[i] = scale.get_units(3);
+      delay(200);
+    }
+    
+    // Calculate range
+    float minReading = readings[0];
+    float maxReading = readings[0];
+    for(int i = 1; i < 5; i++) {
+      if(readings[i] < minReading) minReading = readings[i];
+      if(readings[i] > maxReading) maxReading = readings[i];
+    }
+    float range = maxReading - minReading;
+    
+    terminalPrint("Stability check: " + String(range, 2) + " kg variance");
+    
+    if(range > 0.5) {
+      terminalPrint("⚠️ WARNING: System unstable!");
+      terminalPrint("Readings varying by " + String(range, 2) + " kg");
+      terminalPrint("Check for vibrations, wind, or movement");
+      terminalPrint("Taring anyway...");
+    } else {
+      terminalPrint("✓ System stable. Safe to tare.");
+    }
+    
+    scale.tare();
+    delay(1000);
+    float newWeight = scale.get_units(5);
+    
+    terminalPrint("✓ Scale tared (system weight now = 0 kg)");
+    terminalPrint("Post-tare reading: " + String(newWeight, 2) + " kg");
+    
+    if (abs(newWeight) > 0.5) {
+      terminalPrint("⚠️ Offset: " + String(abs(newWeight), 2) + " kg after tare");
+      terminalPrint("This is unusual. Possible causes:");
+      terminalPrint("1. System moved during tare");
+      terminalPrint("2. Load cell drift/instability");
+      terminalPrint("3. Loose connections");
+      terminalPrint("Try TARE again when system is completely still");
+    } else if (abs(newWeight) > 0.1) {
+      terminalPrint("Minor offset within acceptable range");
+    } else {
+      terminalPrint("✓ Perfect tare! Ready to measure.");
+    }
+  }
+  else if (input.equals("STATUS")) {
+    struct tm timeinfo;
+    getLocalTime(&timeinfo);
+    
+    terminalPrint("\n=== SYSTEM STATUS ===");
+    terminalPrint("Current Time: " + String(timeinfo.tm_hour) + ":" + String(timeinfo.tm_min));
+    terminalPrint("Mode: " + String(currentMode) + " (0=Manual, 1=Auto, 2=AdLib, 3=Weight)");
+    terminalPrint("Blower: " + String(blowerRunning ? "RUNNING" : "IDLE"));
+    terminalPrint("Scheduler 1: " + String(scheduler1_hour) + ":" + String(scheduler1_minute));
+    terminalPrint("Scheduler 2: " + String(scheduler2_hour) + ":" + String(scheduler2_minute));
+    terminalPrint("Scheduler 3: " + String(scheduler3_hour) + ":" + String(scheduler3_minute));
+    terminalPrint("Target Feed: " + String(targetFeedAmount, 1) + " kg");
+    terminalPrint("Camera Delay: " + String(cameraCheckDelay) + " seconds");
+    terminalPrint("Current Weight: " + String(currentReservoirWeight, 2) + " kg");
+    terminalPrint("Feed Level: " + String(currentFeedLevel, 1) + "%");
+    terminalPrint("====================\n");
+  }
+  else if (input.equals("HELP")) {
+    terminalPrint("\n=== COMMANDS ===");
+    terminalPrint("CAL 10.0 - Calibrate scale with known weight");
+    terminalPrint("TARE - Reset scale to zero (system weight)");
+    terminalPrint("STATUS - Show system status");
+    terminalPrint("DIAG - Run load cell diagnostics");
+    terminalPrint("HELP - Show this help");
+    terminalPrint("================\n");
+  }
+  else if (input.equals("DIAG")) {
+    // NEW: Load cell diagnostics
+    terminalPrint("\n=== LOAD CELL DIAGNOSTICS ===");
+    
+    if (!scale.is_ready()) {
+      terminalPrint("❌ CRITICAL: Load cell not responding!");
+      terminalPrint("Check DT (GPIO32) and SCK (GPIO33) connections");
+      return;
+    }
+    
+    terminalPrint("✓ Load cell responding");
+    terminalPrint("Taking 10 readings over 5 seconds...");
+    
+    float readings[10];
+    float sum = 0;
+    float minVal = 999999;
+    float maxVal = -999999;
+    
+    for(int i = 0; i < 10; i++) {
+      readings[i] = scale.get_units(3);
+      sum += readings[i];
+      if(readings[i] < minVal) minVal = readings[i];
+      if(readings[i] > maxVal) maxVal = readings[i];
+      
+      terminalPrint(String(i+1) + ". " + String(readings[i], 3) + " kg");
+      delay(500);
+    }
+    
+    float average = sum / 10;
+    float range = maxVal - minVal;
+    
+    terminalPrint("\n--- ANALYSIS ---");
+    terminalPrint("Average: " + String(average, 2) + " kg");
+    terminalPrint("Min: " + String(minVal, 2) + " kg");
+    terminalPrint("Max: " + String(maxVal, 2) + " kg");
+    terminalPrint("Range: " + String(range, 2) + " kg");
+    
+    // Stability assessment
+    if(range < 0.05) {
+      terminalPrint("✓ EXCELLENT: Very stable readings");
+    } else if(range < 0.2) {
+      terminalPrint("✓ GOOD: Acceptable stability");
+    } else if(range < 0.5) {
+      terminalPrint("⚠️ FAIR: Moderate drift detected");
+      terminalPrint("Possible vibration or temperature change");
+    } else if(range < 2.0) {
+      terminalPrint("⚠️ POOR: High instability");
+      terminalPrint("Check for: vibrations, loose mounting, wind");
+    } else {
+      terminalPrint("❌ CRITICAL: Severe instability!");
+      terminalPrint("Likely causes:");
+      terminalPrint("- Loose wiring to load cell");
+      terminalPrint("- Load cell not properly mounted");
+      terminalPrint("- Defective load cell or HX711");
+    }
+    
+    // Negative weight check
+    if(average < -0.5) {
+      terminalPrint("\n⚠️ NEGATIVE AVERAGE DETECTED");
+      terminalPrint("This means current weight < tare reference");
+      terminalPrint("Solutions:");
+      terminalPrint("1. Type TARE to reset zero point");
+      terminalPrint("2. Add feed to reservoir");
+      terminalPrint("3. Check if something lifted the system");
+    }
+    
+    terminalPrint("=============================\n");
+  }
+}
+
+BLYNK_CONNECTED() {
+  Serial.println("Connected to Blynk!");
+  
+  Blynk.syncVirtual(mode_selector_virtual_pin);
+  Blynk.syncVirtual(feed_amount_virtual_pin);
+  Blynk.syncVirtual(camera_delay_virtual_pin);  // NEW: Sync camera delay
+  Blynk.syncVirtual(scheduler1_virtual_pin);
+  Blynk.syncVirtual(scheduler2_virtual_pin);
+  Blynk.syncVirtual(scheduler3_virtual_pin);
+  Blynk.syncVirtual(tilapia_population_virtual_pin);
+  
+  // Add delay to ensure sync completes
+  delay(1000);
+  
+  Blynk.virtualWrite(tilapia_population_virtual_pin, tilapiaPopulation);
+  Blynk.virtualWrite(estimated_biomass_virtual_pin, estimatedBiomass);
+  Blynk.virtualWrite(weight_per_fish_virtual_pin, currentWeightPerTilapia * 1000);
+  Blynk.virtualWrite(camera_delay_virtual_pin, cameraCheckDelay);  // NEW: Write camera delay
+  
+  Serial.println("Dashboard synced!");
+  terminalPrint("Dashboard synced!");
+  
+  // Debug: Print current mode after sync
+  Serial.print("Current mode after sync: ");
+  Serial.println(currentMode);
+  terminalPrint("Current mode: " + String(currentMode));
+  terminalPrint("Camera delay: " + String(cameraCheckDelay) + "s");
+}
+
+void printLocalTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  Serial.print("Current time: ");
+  Serial.print(timeinfo.tm_hour);
+  Serial.print(":");
+  Serial.print(timeinfo.tm_min);
+  Serial.print(":");
+  Serial.println(timeinfo.tm_sec);
+}
+
+void updateCameraStatus() {
+  int cameraStatus = digitalRead(camera_pin);
+  Blynk.virtualWrite(feeding_status_virtual_pin, cameraStatus);
+}
+
+float measureDistance() {
+  long duration;
+  float distance;
+  
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  distance = (duration * 0.0343) / 2;
+  
+  if (duration == 0) return -1;
+  return distance;
+}
+
+void checkFeedLevel() {
+  float distance = measureDistance();
+  
+  if (distance < 0 || distance < 30) {
+    currentFeedLevel = 100.0;
+    Blynk.virtualWrite(feed_level_virtual_pin, 100);
+    
+    if (lowFeedAlert) {
+      lowFeedAlert = false;
+      Blynk.virtualWrite(low_feed_alert_virtual_pin, 0);
+      terminalPrint("✓ Feed level OK - Reservoir FULL");
+    }
+    return;
+  }
+  
+  if (distance > RESERVOIR_HEIGHT) distance = RESERVOIR_HEIGHT;
+  
+  currentFeedLevel = 100.0 - ((distance / RESERVOIR_HEIGHT) * 100.0);
+  if (currentFeedLevel > 100.0) currentFeedLevel = 100.0;
+  if (currentFeedLevel < 0.0) currentFeedLevel = 0.0;
+  
+  Blynk.virtualWrite(feed_level_virtual_pin, (int)currentFeedLevel);
+  
+  if (distance >= LOW_FEED_THRESHOLD) {
+    if (!lowFeedAlert) {
+      lowFeedAlert = true;
+      Blynk.virtualWrite(low_feed_alert_virtual_pin, 255);
+      terminalPrint("🚨 ALERT: Feed level LOW!");
+    }
+  } else {
+    if (lowFeedAlert) {
+      lowFeedAlert = false;
+      Blynk.virtualWrite(low_feed_alert_virtual_pin, 0);
+    }
+  }
+}
+
+void checkSchedules() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("⚠️ Failed to get time");
+    return;
+  }
+  
+  int currentHour = timeinfo.tm_hour;
+  int currentMinute = timeinfo.tm_min;
+  
+  // Debug: Print current mode and time every minute when minute changes
+  static int lastPrintedMinute = -1;
+  if (currentMinute != lastPrintedMinute) {
+    lastPrintedMinute = currentMinute;
+    Serial.print("Time: ");
+    Serial.print(currentHour);
+    Serial.print(":");
+    Serial.print(currentMinute);
+    Serial.print(" | Mode: ");
+    Serial.print(currentMode);
+    Serial.print(" | Blower: ");
+    Serial.println(blowerRunning ? "RUNNING" : "IDLE");
+  }
+  
+  // Scheduler 1
+  if (scheduler1_hour == currentHour && scheduler1_minute == currentMinute && !scheduler1_triggered) {
+    scheduler1_triggered = true;
+    terminalPrint("⏰ SCHEDULER 1 TRIGGERED!");
+    Serial.print("Current Mode: ");
+    Serial.println(currentMode);
+    Serial.print("Blower Running: ");
+    Serial.println(blowerRunning);
+    
+    if (currentMode != MODE_MANUAL && !blowerRunning) {
+      terminalPrint("✓ Starting feeding cycle...");
+      startFeedingByMode();
+    } else {
+      if (currentMode == MODE_MANUAL) {
+        terminalPrint("❌ Cannot start - System in MANUAL mode");
+      }
+      if (blowerRunning) {
+        terminalPrint("❌ Cannot start - Feeding already in progress");
+      }
+    }
+  }
+  if (scheduler1_minute != currentMinute) {
+    scheduler1_triggered = false;
+  }
+  
+  // Scheduler 2
+  if (scheduler2_hour == currentHour && scheduler2_minute == currentMinute && !scheduler2_triggered) {
+    scheduler2_triggered = true;
+    terminalPrint("⏰ SCHEDULER 2 TRIGGERED!");
+    Serial.print("Current Mode: ");
+    Serial.println(currentMode);
+    
+    if (currentMode != MODE_MANUAL && !blowerRunning) {
+      terminalPrint("✓ Starting feeding cycle...");
+      startFeedingByMode();
+    } else {
+      if (currentMode == MODE_MANUAL) {
+        terminalPrint("❌ Cannot start - System in MANUAL mode");
+      }
+      if (blowerRunning) {
+        terminalPrint("❌ Cannot start - Feeding already in progress");
+      }
+    }
+  }
+  if (scheduler2_minute != currentMinute) {
+    scheduler2_triggered = false;
+  }
+  
+  // Scheduler 3
+  if (scheduler3_hour == currentHour && scheduler3_minute == currentMinute && !scheduler3_triggered) {
+    scheduler3_triggered = true;
+    terminalPrint("⏰ SCHEDULER 3 TRIGGERED!");
+    Serial.print("Current Mode: ");
+    Serial.println(currentMode);
+    
+    if (currentMode != MODE_MANUAL && !blowerRunning) {
+      terminalPrint("✓ Starting feeding cycle...");
+      startFeedingByMode();
+    } else {
+      if (currentMode == MODE_MANUAL) {
+        terminalPrint("❌ Cannot start - System in MANUAL mode");
+      }
+      if (blowerRunning) {
+        terminalPrint("❌ Cannot start - Feeding already in progress");
+      }
+    }
+  }
+  if (scheduler3_minute != currentMinute) {
+    scheduler3_triggered = false;
+  }
+}
+
+// ===== NEW: MODE-BASED FEEDING STARTER =====
+void startFeedingByMode() {
+  blowerRunning = true;
+  dispensedAmountKg = 0.0;
+  feedingStartWeight = scale.get_units(10);
+  
+  String modeInfo;
+  switch(currentMode) {
+    case MODE_AUTO:
+      modeInfo = "AUTO (Smart)";
+      terminalPrint("\n=== AUTO FEEDING STARTED ===");
+      terminalPrint("Target: " + String(targetFeedAmount, 1) + " kg");
+      terminalPrint("Stops when: Weight reached OR fish stop eating");
+      break;
+      
+    case MODE_AD_LIBITUM:
+      modeInfo = "AD LIBITUM";
+      terminalPrint("\n=== AD LIBITUM FEEDING STARTED ===");
+      terminalPrint("NO weight limit - feeds until fish stop eating");
+      terminalPrint("Camera will determine when to stop");
+      break;
+      
+    case MODE_WEIGHT_BASED:
+      modeInfo = "WEIGHT BASED";
+      terminalPrint("\n=== WEIGHT BASED FEEDING STARTED ===");
+      terminalPrint("Target: " + String(targetFeedAmount, 1) + " kg");
+      terminalPrint("NO camera check - feeds until weight reached");
+      break;
+      
+    default:
+      terminalPrint("ERROR: Invalid mode");
+      blowerRunning = false;
+      return;
+  }
+  
+  terminalPrint("Mode: " + modeInfo);
+  terminalPrint("Start weight: " + String(feedingStartWeight, 2) + " kg");
+  terminalPrint("========================================");
+  
+  dispenseFeedCycle();
+}
+
+// ===== MODIFIED: DISPENSING CYCLE WITH MODE LOGIC =====
+void dispenseFeedCycle() {
+  // Measure current weight
+  currentReservoirWeight = scale.get_units(10);
+  dispensedAmountKg = feedingStartWeight - currentReservoirWeight;
+  
+  // Update dashboard
+  Blynk.virtualWrite(dispensed_weight_virtual_pin, dispensedAmountKg);
+  
+  // ===== MODE-SPECIFIC WEIGHT CHECK =====
+  bool weightTargetReached = false;
+  
+  switch(currentMode) {
+    case MODE_AUTO:
+    case MODE_WEIGHT_BASED:
+      // These modes have weight targets
+      if (dispensedAmountKg >= targetFeedAmount) {
+        weightTargetReached = true;
+        terminalPrint("✓ Weight target reached: " + String(dispensedAmountKg, 2) + " kg");
+        stopFeeding();
+        return;
+      }
+      break;
+      
+    case MODE_AD_LIBITUM:
+      // No weight limit in Ad Libitum mode
+      weightTargetReached = false;
+      break;
+  }
+  
+  // Display progress
+  terminalPrint("\n--- Dispensing cycle ---");
+  
+  if (currentMode == MODE_AD_LIBITUM) {
+    terminalPrint("Dispensed: " + String(dispensedAmountKg, 2) + " kg (no limit)");
+  } else {
+    terminalPrint("Dispensed: " + String(dispensedAmountKg, 2) + " / " + String(targetFeedAmount, 1) + " kg");
+  }
+  
+  // Start blower
+  digitalWrite(blower_pin, HIGH);
+  terminalPrint("BLOWER: ON");
+  
+  // Open valve sequence
+  timer.setTimeout(2000L, []() {
+    analogWrite(valve_open_pin, 255);
+    analogWrite(valve_close_pin, 0);
+    terminalPrint("VALVE: Opening (3s)...");
+    
+    timer.setTimeout(VALVE_OPEN_TIME * 1000L, []() {
+      analogWrite(valve_open_pin, 0);
+      analogWrite(valve_close_pin, 0);
+      terminalPrint("Dispensing feed...");
+      
+      // Dispense for set time
+      timer.setTimeout(DISPENSE_TIME * 1000L, []() {
+        
+        // Close valve
+        analogWrite(valve_open_pin, 0);
+        analogWrite(valve_close_pin, 255);
+        terminalPrint("VALVE: Closing (4s)...");
+        
+        timer.setTimeout(VALVE_CLOSE_TIME * 1000L, []() {
+          analogWrite(valve_open_pin, 0);
+          analogWrite(valve_close_pin, 0);
+          terminalPrint("Valve closed");
+          
+          // Measure weight after cycle
+          float cycleWeight = scale.get_units(10);
+          float cycleDispensed = feedingStartWeight - cycleWeight;
+          terminalPrint("Weight after cycle: " + String(cycleDispensed, 2) + " kg");
+          
+          // ===== MODE-SPECIFIC CAMERA CHECK =====
+          if (currentMode == MODE_WEIGHT_BASED) {
+            // WEIGHT BASED: Skip camera check, continue immediately
+            terminalPrint("Weight-based mode: Continuing (no camera check)");
+            dispenseFeedCycle();
+            
+          } else if (currentMode == MODE_AUTO || currentMode == MODE_AD_LIBITUM) {
+            // AUTO & AD LIBITUM: Check camera after waiting
+            terminalPrint("Waiting " + String(cameraCheckDelay) + "s for fish to settle...");
+            terminalPrint("Then checking camera for eating activity");
+            
+            timer.setTimeout(cameraCheckDelay * 1000L, []() {
+              int cameraSignal = digitalRead(camera_pin);
+              
+              if (cameraSignal == HIGH) {
+                terminalPrint("✓ Camera: Tilapia EATING - Continue feeding");
+                dispenseFeedCycle();
+              } else {
+                terminalPrint("✗ Camera: Tilapia STOPPED eating - Ending cycle");
+                stopFeeding();
+              }
+            });
+          }
+        });
+      });
+    });
+  });
+}
+
+void stopFeeding() {
+  digitalWrite(blower_pin, LOW);
+  analogWrite(valve_open_pin, 0);
+  analogWrite(valve_close_pin, 0);
+  blowerRunning = false;
+  
+  // Final measurement
+  currentReservoirWeight = scale.get_units(10);
+  dispensedAmountKg = feedingStartWeight - currentReservoirWeight;
+  
+  // Update totals
+  totalFeedDispensed += dispensedAmountKg;
+  preferences.putFloat("totalFeed", totalFeedDispensed);
+  
+  // Recalculate biomass
+  calculateBiomass();
+  
+  // Display completion message based on mode
+  terminalPrint("\n=== FEEDING COMPLETE ===");
+  
+  String stopReason;
+  switch(currentMode) {
+    case MODE_AUTO:
+      stopReason = "Weight target OR fish stopped eating";
+      break;
+    case MODE_AD_LIBITUM:
+      stopReason = "Fish stopped eating";
+      break;
+    case MODE_WEIGHT_BASED:
+      stopReason = "Weight target reached";
+      break;
+  }
+  }
